@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use PrimerCheck Lite, cite the version archived for your work and the underlying dependencies."
+title: "PrimerCheck Lite"
+type: software
+version: 0.1.0
+date-released: 2026-10-17
+license: MIT
+repository-code: "https://github.com/YOUR-USERNAME/primerchecklite"
+abstract: "Local-first screening of PCR primer pairs with interpretable metrics and downloadable reports."
+keywords:
+  - bioinformatics
+  - PCR
+  - primer design
+  - reproducibility
+authors:
+  - family-names: "PrimerCheck Lite contributors"
