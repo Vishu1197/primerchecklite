@@ -4,45 +4,33 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "primerchecklite"
-version = "0.1.0"
-description = "Local-first primer pair screening with interpretable checks and downloadable reports."
+version = "0.2.0"
+description = "Beginner-friendly PCR and qRT-PCR primer screening"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {file = "LICENSE"}
-authors = [{name = "PrimerCheck Lite contributors"}]
-keywords = ["bioinformatics", "PCR", "primers", "Biopython", "primer3", "molecular biology"]
-classifiers = [
-  "Development Status :: 3 - Alpha",
-  "Environment :: Console",
-  "Intended Audience :: Science/Research",
-  "License :: OSI Approved :: MIT License",
-  "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
-  "Topic :: Scientific/Engineering :: Bio-Informatics",
-]
+license = {text = "MIT"}
 dependencies = [
   "biopython>=1.81",
   "primer3-py>=2.0.0",
-  "typer>=0.12",
-  "rich>=13.7",
+  "typer>=0.9",
+  "rich>=13.0"
 ]
 
 [project.optional-dependencies]
 ui = ["streamlit>=1.32", "pandas>=2.0"]
-dev = ["pytest>=8.0", "ruff>=0.4", "build>=1.2"]
+dev = ["pytest>=7.4", "ruff>=0.3"]
 
 [project.scripts]
 primerchecklite = "primerchecklite.cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
