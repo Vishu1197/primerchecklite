@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0
+
+- Added beginner-oriented descriptions for screening parameters.
+- Added editable minimum and maximum threshold settings in the Streamlit interface.
+- Added a colorful interface with clearer sections, status messaging, and report downloads.
+- Expanded threshold and scientific limitation documentation.
+- Added tests for threshold evaluation and exact template matching.
+
 ## 0.1.0
 
-Initial development version with a Python package, CLI, Streamlit interface, primer metrics, optional exact-match template check, JSON and HTML reports, tests, and documentation. This entry describes repository contents and does not imply external validation or a formal software release.
+- Initial primer screening implementation.
