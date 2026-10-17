@@ -1,270 +1,206 @@
-"""Core screening functions.
-
-These are screening heuristics, not a replacement for empirical validation or
-genome-wide specificity analysis. Primer3 calculations use default thermodynamic
-settings unless callers explicitly configure them in a future release.
-"""
+"""Core sequence validation, primer metrics, and threshold evaluation."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from Bio.Seq import Seq
 from Bio.SeqUtils import gc_fraction
 
 try:
     import primer3
-except ImportError as exc:  # pragma: no cover
+except ImportError:  # pragma: no cover
     primer3 = None
-    _PRIMER3_IMPORT_ERROR = exc
-else:
-    _PRIMER3_IMPORT_ERROR = None
-
 
 DNA_ALPHABET = set("ACGT")
-IUPAC_ALPHABET = set("ACGTRYSWKMBDHVN")
 
 
 @dataclass
-class PrimerMetrics:
-    sequence: str
-    length: int
-    gc_percent: float
-    tm_celsius: float
-    longest_homopolymer: int
-    homopolymer_base: str
-    hairpin_tm_celsius: float | None
-    homodimer_tm_celsius: float | None
-    three_prime_end: str
-    warnings: list[str]
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+class Threshold:
+    minimum: float | None = None
+    maximum: float | None = None
+    unit: str = ""
+    description: str = ""
 
 
-@dataclass
-class PairReport:
-    forward: PrimerMetrics
-    reverse: PrimerMetrics
-    heterodimer_tm_celsius: float | None
-    tm_difference_celsius: float
-    amplicon_length: int | None
-    pair_warnings: list[str]
-    settings: dict[str, Any]
-    limitations: list[str]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "forward": self.forward.to_dict(),
-            "reverse": self.reverse.to_dict(),
-            "heterodimer_tm_celsius": self.heterodimer_tm_celsius,
-            "tm_difference_celsius": self.tm_difference_celsius,
-            "amplicon_length": self.amplicon_length,
-            "pair_warnings": self.pair_warnings,
-            "settings": self.settings,
-            "limitations": self.limitations,
-        }
+DEFAULT_THRESHOLDS: dict[str, Threshold] = {
+    "length": Threshold(18, 30, "nt", "Primer length. Very short or long primers may behave unpredictably."),
+    "gc_percent": Threshold(40, 60, "%", "GC fraction affects duplex stability and primer binding."),
+    "tm_c": Threshold(57, 63, "°C", "Estimated melting temperature under the selected chemical conditions."),
+    "hairpin_tm_c": Threshold(None, 45, "°C", "Higher predicted hairpin Tm can indicate a stable folded primer."),
+    "homodimer_tm_c": Threshold(None, 45, "°C", "Predicted interaction between two copies of the same primer."),
+    "heterodimer_tm_c": Threshold(None, 45, "°C", "Predicted interaction between the forward and reverse primers."),
+    "homopolymer": Threshold(None, 4, "bases", "Longest run of one repeated nucleotide."),
+    "tm_difference_c": Threshold(None, 5, "°C", "Absolute difference between forward and reverse primer Tm."),
+    "three_prime_gc_count": Threshold(1, 5, "bases", "Count of G/C bases in the final five nucleotides. Interpret with assay context."),
+}
 
 
-def normalize_sequence(sequence: str, *, allow_ambiguous: bool = False) -> str:
-    """Normalize a primer sequence and reject non-IUPAC characters."""
-    normalized = "".join(sequence.split()).upper()
-    allowed = IUPAC_ALPHABET if allow_ambiguous else DNA_ALPHABET
-    if not normalized:
-        raise ValueError("Sequence is empty.")
-    invalid = sorted(set(normalized) - allowed)
+def normalize_sequence(sequence: str) -> str:
+    """Normalize DNA input, allowing whitespace and FASTA header lines."""
+    if not isinstance(sequence, str):
+        raise ValueError("Sequence must be text.")
+    lines = [line.strip() for line in sequence.splitlines() if line.strip()]
+    sequence = "".join(line for line in lines if not line.startswith(">"))
+    sequence = "".join(sequence.split()).upper().replace("U", "T")
+    if not sequence:
+        raise ValueError("Enter a DNA sequence.")
+    invalid = sorted(set(sequence) - DNA_ALPHABET)
     if invalid:
-        raise ValueError(
-            "Sequence contains unsupported characters: "
-            + ", ".join(invalid)
-            + (". Use only A, C, G, and T for standard primer screening." if not allow_ambiguous else ".")
-        )
-    return normalized
+        raise ValueError(f"Only A, C, G, and T are supported. Invalid characters: {', '.join(invalid)}")
+    return sequence
 
 
-def longest_homopolymer(sequence: str) -> tuple[int, str]:
-    best_length = 0
-    best_base = ""
-    current_base = ""
-    current_length = 0
+def longest_homopolymer(sequence: str) -> int:
+    best = current = 0
+    previous = None
     for base in sequence:
-        if base == current_base:
-            current_length += 1
-        else:
-            current_base = base
-            current_length = 1
-        if current_length > best_length:
-            best_length, best_base = current_length, base
-    return best_length, best_base
+        current = current + 1 if base == previous else 1
+        best = max(best, current)
+        previous = base
+    return best
 
 
-def _require_primer3() -> None:
+def _tm(sequence: str, settings: dict[str, float]) -> float:
     if primer3 is None:
-        raise RuntimeError(
-            "primer3-py is required for thermodynamic checks. Install with: "
-            "pip install 'primerchecklite[ui]' or pip install primer3-py"
-        ) from _PRIMER3_IMPORT_ERROR
-
-
-def analyze_primer(
-    sequence: str,
-    *,
-    min_length: int = 18,
-    max_length: int = 30,
-    target_tm_min: float = 57.0,
-    target_tm_max: float = 63.0,
-    target_gc_min: float = 40.0,
-    target_gc_max: float = 60.0,
-    max_homopolymer: int = 4,
-    monovalent_salt_mM: float = 50.0,
-    divalent_salt_mM: float = 1.5,
-    dntp_mM: float = 0.6,
-    primer_nM: float = 250.0,
-) -> PrimerMetrics:
-    """Calculate primer metrics using Biopython and Primer3."""
-    _require_primer3()
-    seq = normalize_sequence(sequence)
-    gc = float(gc_fraction(seq) * 100.0)
-    tm = float(primer3.calc_tm(
-        seq,
-        mv_conc=monovalent_salt_mM,
-        dv_conc=divalent_salt_mM,
-        dntp_conc=dntp_mM,
-        dna_conc=primer_nM,
+        raise RuntimeError("Primer3 is required for Tm and structure calculations. Install primer3-py.")
+    return float(primer3.calc_tm(
+        sequence,
+        mv_conc=settings["mv_conc"],
+        dv_conc=settings["dv_conc"],
+        dntp_conc=settings["dntp_conc"],
+        dna_conc=settings["dna_conc"],
     ))
-    hairpin = float(primer3.calc_hairpin(
-        seq, mv_conc=monovalent_salt_mM, dv_conc=divalent_salt_mM,
-        dntp_conc=dntp_mM, dna_conc=primer_nM
-    ).tm)
-    homodimer = float(primer3.calc_homodimer(
-        seq, mv_conc=monovalent_salt_mM, dv_conc=divalent_salt_mM,
-        dntp_conc=dntp_mM, dna_conc=primer_nM
-    ).tm)
-    run_length, run_base = longest_homopolymer(seq)
 
-    warnings: list[str] = []
-    if not min_length <= len(seq) <= max_length:
-        warnings.append(f"Length {len(seq)} nt is outside the configured range ({min_length} to {max_length} nt).")
-    if not target_tm_min <= tm <= target_tm_max:
-        warnings.append(f"Estimated Tm {tm:.1f} °C is outside the configured range ({target_tm_min:.1f} to {target_tm_max:.1f} °C).")
-    if not target_gc_min <= gc <= target_gc_max:
-        warnings.append(f"GC content {gc:.1f}% is outside the configured range ({target_gc_min:.1f}% to {target_gc_max:.1f}%).")
-    if run_length > max_homopolymer:
-        warnings.append(f"Longest homopolymer is {run_base * run_length} ({run_length} bases), above the configured limit of {max_homopolymer}.")
-    if hairpin >= 45.0:
-        warnings.append(f"Potential hairpin structure has a predicted Tm of {hairpin:.1f} °C. Review under assay conditions.")
-    if homodimer >= 45.0:
-        warnings.append(f"Potential self-dimer has a predicted Tm of {homodimer:.1f} °C. Review under assay conditions.")
-    if seq.endswith(("A", "T", "C", "G")):
-        # A terminal G/C count is descriptive, not a standalone pass/fail criterion.
-        gc_clamp = len(seq) - len(seq.rstrip("GC"))
-        if gc_clamp == 0:
-            warnings.append("Primer has no terminal G/C base. This is a descriptive flag, not an automatic rejection.")
 
-    return PrimerMetrics(
-        sequence=seq,
-        length=len(seq),
-        gc_percent=round(gc, 2),
-        tm_celsius=round(tm, 2),
-        longest_homopolymer=run_length,
-        homopolymer_base=run_base,
-        hairpin_tm_celsius=round(hairpin, 2),
-        homodimer_tm_celsius=round(homodimer, 2),
-        three_prime_end=seq[-5:],
-        warnings=warnings,
+def analyze_primer(sequence: str, settings: dict[str, float] | None = None) -> dict[str, Any]:
+    sequence = normalize_sequence(sequence)
+    settings = settings or default_settings()
+    tm = _tm(sequence, settings)
+    if primer3 is None:
+        raise RuntimeError("Primer3 is required for thermodynamic calculations.")
+    hp = primer3.calc_hairpin(
+        sequence, mv_conc=settings["mv_conc"], dv_conc=settings["dv_conc"],
+        dntp_conc=settings["dntp_conc"]
     )
+    hd = primer3.calc_homodimer(
+        sequence, mv_conc=settings["mv_conc"], dv_conc=settings["dv_conc"],
+        dntp_conc=settings["dntp_conc"]
+    )
+    return {
+        "sequence": sequence,
+        "length": len(sequence),
+        "gc_percent": round(float(gc_fraction(sequence) * 100), 2),
+        "tm_c": round(tm, 2),
+        "hairpin_tm_c": round(float(hp.tm), 2),
+        "homodimer_tm_c": round(float(hd.tm), 2),
+        "homopolymer": longest_homopolymer(sequence),
+        "three_prime_end": sequence[-5:],
+        "three_prime_gc_count": sum(base in "GC" for base in sequence[-5:]),
+    }
 
 
-def find_amplicon_length(template: str, forward: str, reverse: str) -> int | None:
-    """Find a single exact inward-facing amplicon in a supplied DNA template.
+def default_settings() -> dict[str, float]:
+    return {"mv_conc": 50.0, "dv_conc": 1.5, "dntp_conc": 0.2, "dna_conc": 50.0}
 
-    This simple exact-match helper is intentionally not a genome-wide primer
-    specificity search. It returns a length only when exactly one inward-facing
-    pair of binding sites can be identified on the supplied sequence.
-    """
-    from Bio.Seq import Seq
 
-    tmpl = normalize_sequence(template, allow_ambiguous=True)
-    fwd = normalize_sequence(forward)
-    rev_binding = str(Seq(normalize_sequence(reverse)).reverse_complement())
-    forward_starts = [i for i in range(len(tmpl)) if tmpl.startswith(fwd, i)]
-    reverse_starts = [i for i in range(len(tmpl)) if tmpl.startswith(rev_binding, i)]
+def default_threshold_values() -> dict[str, dict[str, Any]]:
+    return {name: asdict(value) for name, value in DEFAULT_THRESHOLDS.items()}
+
+
+def evaluate_value(value: float, threshold: dict[str, Any]) -> str:
+    minimum, maximum = threshold.get("minimum"), threshold.get("maximum")
+    if minimum is not None and value < minimum:
+        return "review"
+    if maximum is not None and value > maximum:
+        return "review"
+    return "within_range"
+
+
+def _add_status(metrics: dict[str, Any], thresholds: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    result = dict(metrics)
+    statuses = {}
+    for key, threshold in thresholds.items():
+        if key in metrics and isinstance(metrics[key], (int, float)):
+            statuses[key] = evaluate_value(float(metrics[key]), threshold)
+    result["statuses"] = statuses
+    return result
+
+
+def find_amplicon(template: str, forward: str, reverse: str,
+                  min_length: int = 1, max_length: int = 10000) -> dict[str, Any]:
+    """Find one exact inward-facing product on a supplied template."""
+    template = normalize_sequence(template)
+    forward = normalize_sequence(forward)
+    reverse_binding = str(Seq(normalize_sequence(reverse)).reverse_complement())
     candidates = []
-    for f_start in forward_starts:
-        for r_start in reverse_starts:
-            if r_start >= f_start + len(fwd):
-                candidates.append((f_start, r_start + len(rev_binding)))
-    if len(candidates) != 1:
-        return None
-    start, end = candidates[0]
-    return end - start
+    start = 0
+    while True:
+        fpos = template.find(forward, start)
+        if fpos < 0:
+            break
+        rpos = template.find(reverse_binding, fpos + len(forward))
+        while rpos >= 0:
+            length = rpos + len(reverse_binding) - fpos
+            if min_length <= length <= max_length:
+                candidates.append({"start_0_based": fpos, "end_0_based_exclusive": rpos + len(reverse_binding),
+                                   "length_bp": length})
+            rpos = template.find(reverse_binding, rpos + 1)
+        start = fpos + 1
+    if len(candidates) == 1:
+        return {"status": "unique_exact_product", **candidates[0]}
+    if len(candidates) == 0:
+        return {"status": "no_unique_exact_product", "message": "No exact inward-facing product was found within the selected length range."}
+    return {"status": "ambiguous", "candidate_count": len(candidates),
+            "message": "Multiple exact products were found. Review specificity separately."}
 
 
 def analyze_pair(
     forward: str,
     reverse: str,
-    *,
     template: str | None = None,
-    min_amplicon_length: int = 100,
-    max_amplicon_length: int = 1000,
-    **primer_settings: Any,
-) -> PairReport:
-    """Analyze two primers and produce a transparent pair-level report."""
-    _require_primer3()
-    fwd = analyze_primer(forward, **primer_settings)
-    rev = analyze_primer(reverse, **primer_settings)
-    settings = {
-        "tm_model": "Primer3 default nearest-neighbor thermodynamic model",
-        "monovalent_salt_mM": primer_settings.get("monovalent_salt_mM", 50.0),
-        "divalent_salt_mM": primer_settings.get("divalent_salt_mM", 1.5),
-        "dntp_mM": primer_settings.get("dntp_mM", 0.6),
-        "primer_nM": primer_settings.get("primer_nM", 250.0),
-        "tm_range_celsius": [
-            primer_settings.get("target_tm_min", 57.0),
-            primer_settings.get("target_tm_max", 63.0),
-        ],
-        "gc_range_percent": [
-            primer_settings.get("target_gc_min", 40.0),
-            primer_settings.get("target_gc_max", 60.0),
+    settings: dict[str, float] | None = None,
+    thresholds: dict[str, dict[str, Any]] | None = None,
+    amplicon_min: int = 1,
+    amplicon_max: int = 10000,
+) -> dict[str, Any]:
+    settings = settings or default_settings()
+    thresholds = thresholds or default_threshold_values()
+    f = analyze_primer(forward, settings)
+    r = analyze_primer(reverse, settings)
+    hetero = primer3.calc_heterodimer(
+        f["sequence"], r["sequence"], mv_conc=settings["mv_conc"],
+        dv_conc=settings["dv_conc"], dntp_conc=settings["dntp_conc"]
+    )
+    pair_metrics = {
+        "tm_difference_c": round(abs(f["tm_c"] - r["tm_c"]), 2),
+        "heterodimer_tm_c": round(float(hetero.tm), 2),
+    }
+    f = _add_status(f, thresholds)
+    r = _add_status(r, thresholds)
+    pair_metrics = _add_status(pair_metrics, thresholds)
+    warnings = []
+    for label, primer in (("Forward", f), ("Reverse", r)):
+        for metric, status in primer["statuses"].items():
+            if status == "review":
+                t = thresholds[metric]
+                warnings.append(f"{label} primer: {metric.replace('_', ' ')} is {primer[metric]}, outside the configured range ({t.get('minimum')} to {t.get('maximum')} {t.get('unit', '')}).")
+    for metric, status in pair_metrics["statuses"].items():
+        if status == "review":
+            t = thresholds[metric]
+            warnings.append(f"Primer pair: {metric.replace('_', ' ')} is {pair_metrics[metric]}, outside the configured range ({t.get('minimum')} to {t.get('maximum')} {t.get('unit', '')}).")
+    amplicon = find_amplicon(template, f["sequence"], r["sequence"], amplicon_min, amplicon_max) if template else None
+    return {
+        "forward": f,
+        "reverse": r,
+        "pair": pair_metrics,
+        "warnings": warnings,
+        "settings": settings,
+        "thresholds": thresholds,
+        "amplicon": amplicon,
+        "limitations": [
+            "Thresholds are configurable screening guides, not universal PCR rules.",
+            "Exact template matching is not genome-wide specificity analysis.",
+            "In silico metrics do not establish amplification efficiency or experimental success.",
         ],
     }
-    heterodimer = float(primer3.calc_heterodimer(
-        fwd.sequence, rev.sequence,
-        mv_conc=settings["monovalent_salt_mM"],
-        dv_conc=settings["divalent_salt_mM"],
-        dntp_conc=settings["dntp_mM"],
-        dna_conc=settings["primer_nM"],
-    ).tm)
-    tm_difference = abs(fwd.tm_celsius - rev.tm_celsius)
-    pair_warnings: list[str] = []
-    if tm_difference > 5.0:
-        pair_warnings.append(f"Primer Tm values differ by {tm_difference:.1f} °C. Review annealing conditions and design.")
-    if heterodimer >= 45.0:
-        pair_warnings.append(f"Potential cross-dimer has a predicted Tm of {heterodimer:.1f} °C. Review under assay conditions.")
-
-    amplicon_length = None
-    if template:
-        amplicon_length = find_amplicon_length(template, fwd.sequence, rev.sequence)
-        if amplicon_length is None:
-            pair_warnings.append("Could not identify exactly one inward-facing, exact-match amplicon in the supplied template. Mismatches and genome-wide off-targets are not evaluated.")
-        elif not min_amplicon_length <= amplicon_length <= max_amplicon_length:
-            pair_warnings.append(
-                f"Amplicon length {amplicon_length} bp is outside the configured range "
-                f"({min_amplicon_length} to {max_amplicon_length} bp)."
-            )
-
-    limitations = [
-        "Predictions depend on the configured concentrations, salt conditions, thermodynamic model, and assay conditions.",
-        "Hairpin and dimer melting temperatures are screening signals, not definitive evidence of PCR failure.",
-        "Exact amplicon matching checks only the supplied template and does not evaluate mismatches, variants, or genome-wide off-targets.",
-        "This tool does not replace NCBI Primer-BLAST, in silico PCR against an appropriate reference, or wet-lab validation.",
-    ]
-    return PairReport(
-        forward=fwd,
-        reverse=rev,
-        heterodimer_tm_celsius=round(heterodimer, 2),
-        tm_difference_celsius=round(tm_difference, 2),
-        amplicon_length=amplicon_length,
-        pair_warnings=pair_warnings,
-        settings=settings,
-        limitations=limitations,
-    )
